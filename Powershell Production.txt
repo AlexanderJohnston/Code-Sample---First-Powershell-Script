@@ -1,0 +1,1095 @@
+<#
+
+    Requirements:
+    - Version 2.0+ Powershell
+    - Microsoft Excel 2007+
+    - Anchor Software/Mirus DoAlls
+
+    File Storage:
+    - Configuration Files: /00-PROGRAMS/
+    - Working Fiiles:      /XX-WORKING/
+    - Input Data:          *.xlsx/ ; *.csv/ ; *.tab/ ; *.txt/ ; *.xls/
+
+    This is a script to automate the data processing (ETL) for outside jobs from new and irregular clients.
+    Written in Windows Powershell.
+    VER: 0.9 | Jun, 1 2016
+    COMPLETE FEATURES: Excel Convert, 206, List Convert, CASS, REFORMAT, 218.
+    PENDIING FEATURES: Network I/O for NCOA processing, queue manager, group sessions.
+
+    ----------------------
+    CALL VARIABLES
+    ----------------------
+#>
+
+# Only the most important variables are currently documented.
+# This script has been replaced by new programs using the Redpoint Data Management language.
+# Documentation and development are now halted.
+
+# IMPORTANT VARIABLES:
+
+$job_number = 'XX0000'
+# Title of the job.
+
+$mirus = (Get-ItemProperty -Path 'Registry::HKEY_LOCAL_MACHINE\System\ControlSet001\Control\Session Manager\Environment' -Name (Mirus_Active_Directory).Mirus_Active_Directory)
+# Mirus is the root folder which contains all sub-folders and the main script.
+
+$CRLF = 0
+# Determines the end byte of a fixed width record.
+
+$global:includetracker = @{}
+# Contains the information about position and byte range for 'include' data that doesn't fit Mirus Format 0.
+
+$Path = ''
+# The working folder where most of the edits are performed.
+
+# All variables below this point are for holding simple interface values.
+
+$current_step = 0
+$confirm = 'N'
+$doesexist = $TRUE
+$fix_or_create = 'is the old directory.'
+$checklist1 = 'PENDING'
+$checklist2 = 'PENDING'
+$checklist3 = 'PENDING'
+$checklist4 = 'PENDING'
+$checklist5 = 'PENDING'
+$checklist6 = 'PENDING'
+$checklist7 = 'PENDING'
+$menuoption = '0'
+$i = 0
+$INPUT_RECORDS = 0
+$BAD_RECORDS = 00
+$CASS_RECORDS = 0
+$NCOA_RECORDS = 0
+$RFM_RECORDS = 0
+
+
+# ----------------------
+#    SET FUNCTIONS
+# ----------------------
+
+# Functions are modules that can be called upon later in the script. Always include variables in the order they're requested.
+# For example: If GET CRLF is the function 'ConvertTo-String' and it requires a variable for the FILE, then you would use 'ConvertTo-String $Path_To_File'
+# Functions may also return a variable. In this case you would define the variables using the function.
+# For example: '$CRLF = ConvertTo-String $Path_To_File' ... this would set the variable $CRLF to the result of ConvertTo-String performed on $Path_To_File.
+
+#    GET ACTIVE DIRECTORY -- [NO VARIABLES]
+function MIRUS_RESET
+{
+  $script:mirus = (Get-ItemProperty -Path 'Registry::HKEY_LOCAL_MACHINE\System\ControlSet001\Control\Session Manager\Environment' -Name (Mirus_Active_Directory).Mirus_Active_Directory)
+}
+
+#    GET CRLF POSITION -- [VARIABLE IN: Path to the file] -- [VARIABLE OUT: CRLF #] -- [USAGE: $CRLF = ConvertTo-String $Path_To_File]
+filter ConvertTo-String
+{
+  Param (
+    [Parameter( Mandatory = $True,
+        Position = 0,
+    ValueFromPipeline = $True )]
+    [ValidateScript( { -not (Test-Path $_ -PathType Container) } )]
+    [String]
+    $Path
+  )
+  $Stream = New-Object IO.FileStream -ArgumentList (Resolve-Path $Path), ‘Open’, ‘Read’
+
+  #    NOTE: Codepage 28591 returns a 1-to-1 char to byte mapping necessary for Anchor.
+  $Encoding = [Text.Encoding]::GetEncoding(28591)
+  $StreamReader = New-Object IO.StreamReader -ArgumentList $Stream, $Encoding
+  $BinaryText = $StreamReader.ReadToEnd()
+  $StreamReader.Close()
+  $Stream.Close()
+  Write-Output $BinaryText
+
+}
+
+#    GET THE MAX WIDTH FOR EACH FIELD IN ALL FILES. FIELDS MUST BE IN THE SAME ORDER. FIRST NAME FOR File #1 MUST BE SAME COLUMN AS File #2.
+#    [VARIABLE IN: $mirus = root folder, $Path = working folder] -- [VARIABLE OUT: First variable is array of all field lengths, Second variable is total fields.]
+#    [USAGE: $array_variable = @(); $total_fields = 0; $array_variable,$total_fields = Get-MAXRPT $mirus $Path]
+#    ----
+#    [Function Variables]: $rptlines is a hash table to store the contents of .rpt files. $rptcount is a hash table to store the number of lines in the .rpt files.
+#                          $i2 is the current row of the hash table being used. $i3 is the specific file being referenced in the hash table.
+#                          For example, if I'm saving $rptcount[$rpt.BaseName] to $countstorage[$i3] then I am saving the number of lines (rptcount) for the current
+#                          file ($rpt.BaseName) and I'm writing them to the variable $countstorage on row number $i3.
+# 						   $i2 and $i3 are counters used to store the key and value on a hash table or array.
+function Get-MAXRPT
+{
+  Param(
+    [string]$mirus,
+    [string]$Path
+  )
+  $env:Mirus_Active_Directory = $Path
+  $rptlines = @{}
+  $rptcount = @{}
+  $countstorage = @{}
+  $filecount = ( Get-ChildItem -Path $Path -Filter '*.CSV' | Measure-Object ).Count;
+  $rptcompare = @(0..($filecount - 1))
+  $i2 = 0
+  $i3 = 0
+  $wait = 0
+  
+  #    Convert the RPT files so they may be compared.
+  While ($wait -ne $filecount){
+    Get-ChildItem -Path $Path -Filter '*.csv' | ForEach-Object -Process {
+      $escape_mirus = '--%'
+      $mirus_parameters1 = $_.FullName
+      $mirus_parameters2 = $Path + $_.BaseName + '.CVT'
+      $mirus_parameters3 = '044 010 0 ADDCRLF'
+      $mirus_parameters4 = $Path + $_.BaseName + '.RPT'
+      mirus206.exe $escape_mirus $mirus_parameters1 $mirus_parameters2 $mirus_parameters3 $mirus_parameters4
+      $wait++
+      while (!(Test-Path "$Path$($_.BaseName).CVT")) { Start-Sleep -Milliseconds 1200 }
+    }
+  }
+  
+  # Store each line of the report into memory, as well as count the total lines in each report to store into memory.
+  Foreach ($rpt in (Get-ChildItem -Path $Path -Filter '*.rpt')){
+  
+    #    Array the values so they may be compared.
+    $rptlines[$rpt.BaseName] = @()
+    $rptlines[$rpt.BaseName] += (Get-Content -Path $rpt.FullName)
+	
+	#    Array the number of lines so they may be used as a hash table key.
+    $rptcount[$rpt.BaseName] = @()
+    $rptcount[$rpt.BaseName] += (Get-Content -Path $rpt.FullName | Measure-Object -Line)
+    $rptcount[$rpt.BaseName] = $rptcount[$rpt.BaseName].lines
+    $rptcount[$rpt.BaseName] = $rptcount[$rpt.BaseName] + 2
+    $countstorage[$i3] = $rptcount[$rpt.BaseName]
+	
+    For ($i2 = 0; $i2 -lt $rptcount[$rpt.BaseName]; $i2++){
+      #    Convert the strings to their numerical range.
+      If ($i2 -eq 0 -or $i2 -eq 1 -or $i2 -eq 2){}
+      Else{
+        $rptlines[$rpt.BaseName][$i2] = $($rptlines[$rpt.BaseName][$i2]).substring(0,9)
+        [int]$Num1 = [convert]::ToInt32($(($rptlines[$rpt.BaseName][$i2]).substring(0,4)), 10)
+        [int]$Num2 = [convert]::ToInt32($(($rptlines[$rpt.BaseName][$i2]).substring(5,4)), 10)
+        $rptlines[$rpt.BaseName][$i2] = ($Num2 - $Num1 + 1)
+        }
+      }
+	  
+    $rptcompare[$i3] = @{}
+    $rptcompare[$i3] = $rptlines[$rpt.BaseName] 
+    $i3++ 
+    }
+	
+  $i3 = 0
+  $master206 = @(0..($countstorage[$i3]-4))
+  $savemaster = 0
+  
+  #    Compare every row for every file and determine the greatest length for each. $savemaster is a flag to determine if we've completed a file yet.
+  #    $master206 is the final output that holds the field lengths. $rptcompare holds the individual field lengths for each file. In this case
+  #    $i3 = the file we're working on and $i2 = the row we're working on. Finally, $countstorage contains the number of lines for each file. 
+  
+  For ($i2 = 0; $i2 -lt $countstorage[$i3]; $i2++){
+    If ($i2 -eq 0 -or $i2 -eq 1 -or $i2 -eq 2){}
+    Else{
+      If ($savemaster -ne 1){
+        If ($filecount -ne 1){
+          If ( ($rptcompare[$i3][$i2]) -gt ($rptcompare[$i3+1][$i2])){$master206[$i2-3] = ($rptcompare[$i3][$i2])}
+            Else{$master206[$i2-3] = ($rptcompare[$i3+1][$i2])}
+        }
+        Else{$master206[$i2-3] = ($rptcompare[$i3][$i2])}
+      }
+      Else{
+        If ( ($rptcompare[$i3+1][$i2]) -gt $master206[$i2-3] ){$master206[$i2-3] = ($rptcompare[$i3+1][$i2])}        
+        }
+      If (($i3 - ($filecount-2)) -lt 0 -And $i2 -eq ($countstorage[$i3] -1)){$i3++
+        $i2=0
+      $savemaster=1}
+    }
+  }
+  $env:Mirus_Active_Directory = $mirus
+  return @($master206),$($countstorage[$i3]-2)
+}
+
+#    CONVERT XLSX TO CSV
+Function ExcelToCSV ($File)
+{
+  $Excel = New-Object -ComObject Excel.Application
+  $Excel.Visible = $false
+  $Excel.DisplayAlerts = $false
+  $wb = $Excel.Workbooks.Open($File.FullName)
+  foreach ($ws in $wb.Worksheets)
+  {
+    $ws.SaveAs(($File.FullName -replace '.xlsx$') + '.csv', 6)
+  }
+  $wb = $Excel.Workbooks.Close()
+  $Excel.Quit()
+}
+
+#    CONVERT XLS TO CSV
+Function XLSToCSV ($File)
+{
+  $Excel = New-Object -ComObject Excel.Application
+  $Excel.Visible = $false
+  $Excel.DisplayAlerts = $false
+  $wb = $Excel.Workbooks.Open($File.FullName)
+  foreach ($ws in $wb.Worksheets)
+  {
+    $ws.SaveAs(($File.FullName -replace '.xls$') + '.csv', 6)
+  }
+  $wb = $Excel.Workbooks.Close()
+  $Excel.Quit()
+}
+
+#    CONVERT TAB TO CSV
+Function TabToCSV ($File)
+{
+  $Excel = New-Object -ComObject Excel.Application
+  $Excel.Visible = $false
+  $Excel.DisplayAlerts = $false
+  $wb = $Excel.Workbooks.Open($File.FullName)
+  foreach ($ws in $wb.Worksheets)
+  {
+    $ws.SaveAs(($File.FullName -replace '.tab$') + '.csv', 6)
+  }
+  $wb = $Excel.Workbooks.Close()
+  $Excel.Quit()
+}
+
+#    FIXES THE MIRUS ENVIRONMENT VARIABLE
+function MIRUS_FIX
+{
+  Clear-Host
+  Write-Output -InputObject "$mirus $fix_or_create"
+  Write-Output ''
+  $script:mirus = Read-Host -Prompt 'Where are we working?'
+  $env:Mirus_Active_Directory = $mirus
+  $doesexist = Test-Path $mirus
+  If ($doesexist -eq $false)
+  {
+    $fix_or_create = 'does not exist. Please create it and try again.'
+    MIRUS_FIX
+  }
+}
+
+#    LOOP UNTIL DIRECTORY IS SET AND EXISTS
+function MIRUS_ENVIRONMENT
+{
+  While ($confirm -ne 'Y')
+  {
+    MIRUS_RESET
+    Clear-Host
+    Write-Output -InputObject "Your current active directory is... $mirus"
+    Write-Output ''
+    Write-Output -InputObject 'Do you wish you use this folder?'
+    Write-Output ''
+    $confirm = Read-Host -Prompt 'Y/N'
+    If ($confirm -ne 'Y')
+    {
+      MIRUS_FIX
+    }
+    }
+  Clear-Host
+  Write-Output -InputObject 'Your Mirus environment variable is now set.'
+  $script:checklist1 = 'COMPLETE'
+  $confirm = 'N'
+  Menu
+}
+
+function JOB_SELECT
+{
+  Clear-Host
+  Write-Output -InputObject 'Please enter the name of your job. (EX: SR5010)'
+  $script:job_number = Read-Host -Prompt 'What are we working on?'
+  Clear-Host
+  $checklist2 = 'COMPLETE'
+  Menu
+}
+
+
+#    Prepare Files is a function that handles max field lengths, 206, and list convert. 
+#    [VARIABLES IN: None] -- [VARIABLES OUT: None] -- [USAGE: PREPARE_FILES]
+#    The rest of the functions from here are out have not been fully documented.
+function PREPARE_FILES
+{
+  Clear-Host
+  $mirus = $env:Mirus_Active_Directory
+  $confirm = 'N'
+  $Path = $mirus + 'XX-WORKING\*'
+  $mirusenv = $mirus + 'XX-WORKING\'
+  $confirm = Read-Host -Prompt 'Are you ready to delete old WORKING files? Y/N'
+  $TOTAL_COUNT = 0
+  $redo = 0
+  $samefile = 'N'
+  $includetracker = @{}
+  If ($confirm -eq 'Y')
+  {
+    If ($checklist1 -eq 'COMPLETE')
+    {
+      Remove-Item $Path -Recurse
+    }
+    Else
+    {
+      $checklist1 = 'ERROR'
+      $scipt:confirm = 'N'
+      Menu
+    }
+  }
+  Clear-Host
+  Write-Output -InputObject "$Path has been cleaned up."
+  Write-Output -InputObject 'Converting available files from Active Directory to /XX-WORKING/ in CSV format.'
+  Foreach ($File in (Get-ChildItem -Path $mirus -Filter '*.xlsx'))
+  {
+    ExcelToCSV -File ($File)
+  }
+  Foreach ($File in (Get-ChildItem -Path $mirus -Filter '*.xls'))
+  {
+    XLSToCSV -File ($File)
+  }
+  Foreach ($File in (Get-ChildItem -Path $mirus -Filter '*.tab'))
+  {
+    TabToCSV -File ($File)
+  }
+  #    MOVE FILES TO \XX-WORKING\
+  Foreach ($File in (Get-ChildItem -Path $mirus -Filter '*.csv'))
+  {
+    $Path = $mirus + 'XX-WORKING\'
+    Move-Item $File.FullName $Path
+  }
+  #    PREPARE FOR MIRUS IN \XX-WORKING\
+  $root = $mirus
+  $env:Mirus_Active_Directory = $Path
+  #    MIRUS 206
+  Get-ChildItem $Path |
+  `
+  Where-Object -FilterScript {$_.Name.Contains(' ') } | Rename-Item -NewName {$_.Name -replace ' ', '_'}
+  #    MIRUS 206 and MAXCONVERT
+  Clear-Host
+  Write-Output -InputObject 'Automatically determining max field length for all files.'
+  Copy-Item -Path ($root + '00-PROGRAMS\206.txt') -Destination ($Path + '206.txt')
+  $206content = Get-Content -Path "$($PATH)206.txt"
+  $206txt = @()
+  $206txt,$206count = Get-MAXRPT $mirus $Path
+  $206wrapper = 1
+  For ($i=0; $i -lt ($206count-1);$i++){
+    $i2 = $($206txt[$i])
+    If ($i -eq 0){$206txt[$i] = "$206wrapper-$($206txt[$i])";$206wrapper = $i2+1}
+    Else{$206txt[$i] = "`r`n$($206wrapper)-$($206wrapper+$($206txt[$i])-1)";$206wrapper = ($206wrapper+$i2)}
+    }
+  $206X = @()
+  $206X += $206content[0] -replace 'X', "$206txt"
+  $206X | Out-File -FilePath "$($PATH)206.txt" -Encoding default
+  Write-Output -InputObject ''
+  Write-Output -InputObject $206txt
+  Write-Output -InputObject ''
+  Write-Output -InputObject 'These maximum lengths will be handled by the 206.'
+  Write-Output -InputObject ''
+  Read-Host -Prompt 'Press enter to 206 using maximum field lengths'
+  $MLC = 0
+  Get-ChildItem -Path $Path -Filter '*.csv' | ForEach-Object -Process {
+    $env:Mirus_Active_Directory = $mirusenv
+    $escape_mirus = '--%'
+    $mirus_parameters1 = $_.FullName + '/' + $Path + '206.txt'
+    $mirus_parameters2 = $Path + $_.BaseName + '.CVT'
+    $mirus_parameters3 = '044 010 0 ADDCRLF'
+    $mirus_parameters4 = $Path + $_.BaseName + '.RPT'
+    mirus206.exe $escape_mirus $mirus_parameters1 $mirus_parameters2 $mirus_parameters3 $mirus_parameters4
+    Start-Sleep -Milliseconds 500
+    }
+      While ($MLC -eq 0){
+        Clear-Host
+        #    PREPARE MAXCONVERT
+        Clear-Host
+        $filecount = ( Get-ChildItem -Path $Path -Filter '*.RPT' | Measure-Object ).Count;
+        $completed_file_counter = 0
+        Read-Host -Prompt 'Press enter to begin the list convert process'
+        Foreach ($Files in (Get-ChildItem -Path $Path -Filter '*.rpt')){
+          While ($completed_file_counter -lt ($filecount)){
+            $global:includetracker[$job_number] = @()
+            $redo = 0
+            If ($redo -eq 1 -And $samefile -ne 'Y'){$samefile = Read-Host -Prompt 'Are your fields in the same order for all files? Y/N'}
+            $line_count = (Get-Content -Path $Files.FullName | Measure-Object -Line)
+            $line_count = $line_count.Lines
+            $line_count += 2
+            [array]$lines = (Get-Content -Path $Files.FullName)
+            #[array]$header = (Get-Content -Path "$Path$($Files.BaseName).CVT")
+            $header = (Get-Content "$Path$($Files.BaseName).CVT" -First 1)
+            #$header = ([regex]::matches($header, '.{50}') | %{$_.value}) -join "`n"
+            [array]$listconvert = (1 .. $line_count)
+            [array]$displaylist = (1 .. $line_count)
+            [array]$output_lines = (1 .. $line_count)
+            Write-Output -InputObject 'I am now checking to see if your files are different lengths.'
+            Write-Output -InputObject '...'
+            If ($lines -ne $line_count){}
+            If ($samefile -ne 'Y'){For ($i = 0; $i -lt $line_count; $i++)
+              {
+                Write-Output -InputObject $line_count
+                if ($i -eq 0 -OR $i -eq 1 -OR $i -eq 2)
+                {
+                  $listconvert[$i] = $null
+                  $output_lines[$i] = $null
+                  continue
+                }
+                Clear-Host
+                $MLC_VALUE = $($lines[$i].substring(0,9))
+                Write-Output -InputObject "You are working on: $($lines[1])"
+                Write-Output -InputObject ''
+                Write-Output -InputObject 'Please define your fields now.' 
+                Write-Output -InputObject ''
+                Write-Output -InputObject 'Options = NAM, FNM, MNM, LNM, TTL, SFX, AD1, AD2, AD3, CMP, CSZ, INC'
+                Write-Output -InputObject 'If Z5-Z4 shows up with a dash, type ZIP instead of CSZ.'
+                Write-Output -InputObject ''
+                Write-Output -InputObject "RPT = $($lines[$i])"
+                Write-Output -InputObject ''
+                Write-Output -InputObject "HEADER = $($header[(($MLC_VALUE.substring(0,4))-1)..(($MLC_VALUE.substring(5,4))-1)])"
+                Write-Output -InputObject ''
+                $MLC_IDENT = Read-Host -Prompt 'Please assign this line or hit enter to skip.'
+                If ($MLC_IDENT -eq ''){
+                  $listconvert[$i] = $null
+                }
+                Else{
+                  If ($MLC_IDENT -eq 'INC'){
+                    $global:includetracker[$job_number] += $MLC_Value}
+                  If ($MLC_IDENT -eq 'ZIP'){
+                    [int]$intNum1 = [convert]::ToInt32($($mlc_value.substring(0,4)), 10)
+                    [int]$intNum2 = [convert]::ToInt32($($mlc_value.substring(5,4)), 10)
+                    $listconvert[$i] = "`r`nCSZ=$($intnum1)-$(($intnum1)+4)`r`nCSZ=$(($intnum2)-3)-$($intnum2)"
+                  continue}
+                  Else{
+                    If ($i -ne 3){$listconvert[$i] = "`r`n$MLC_IDENT=$MLC_VALUE"}
+                    Else{$listconvert[$i] = "$MLC_IDENT=$MLC_VALUE"}
+                  }
+                }
+                $listconvert[$i] -replace ' ', ''
+            }}Else{Read-Host -Prompt 'Press enter to process the next file.'}
+            Clear-Host
+            $CRFILE = "$Path$($Files.BaseName).CVT"
+            $CRLF = FIND_CRLF($CRFILE)
+            $listconvert = $listconvert | Where-Object {$_}
+            $CVT = Get-Content -Path "$mirus\00-PROGRAMS\MLC.MLC"
+            $CVTlocator = "$($mirus)00-PROGRAMS\MLC.MLC"
+            Copy-Item $CVTlocator -Destination "$($CVTlocator).bak"
+            $CVTMLC = @()
+            $CVTMLC += $CVT[0] -replace ';ACTIVE_DIRECTORY=', ";ACTIVE_DIRECTORY=$Path"
+            $CVTMLC += $CVT[1]
+            $CVTMLC += $CVT[2] -replace 'INPUT FILENAME=', "INPUT FILENAME=$Path$($Files.BaseName).CVT"
+            $CVTMLC += $CVT[3] -replace 'OUTPUT FILENAME=', "OUTPUT FILENAME=$Path$($Files.BaseName).000"
+            $CVTMLC += $CVT[4] -replace 'INPUT RECORD SIZE=', "INPUT RECORD SIZE=$CRLF"
+            $CVTMLC += $CVT[5..9]
+            If ($samefile -ne 'Y'){$CVTMLC += $CVT[10] -replace 'X', "$listconvert"}
+            If ($samefile -ne 'Y'){$CVTMLC += $CVT[11..21]}Else{$CVTline_count = (Get-Content -Path "$($CVTLocator).sav" | Measure-Object -Line);
+              $CVT = Get-Content -Path "$mirus\00-PROGRAMS\MLC.MLC.sav";
+            $CVTline_count = ($CVTline_count.Lines +5);$CVTMLC += $CVT[10..$($CVTline_count)]}
+            $CVTMLC | Out-File -FilePath "$mirus\00-PROGRAMS\MLC.MLC" -Encoding default
+            If ($samefile -ne 'Y'){Write-Output -InputObject 'Your MLC will be processed like this:'
+              Write-Output -InputObject "$listconvert"
+              Write-Output -InputObject ''
+              $COMPARE_MLC = Read-Host -Prompt 'Do you wish to compare this to your .CVT file?'
+              If ($COMPARE_MLC -eq 'Y'){Invoke-Item "$Path$($Files.BaseName).CVT"}
+              Clear-Host
+              Write-Output -InputObject 'Your MLC will be processed like this:'
+              Write-Output -InputObject "$listconvert"
+              Write-Output -InputObject ''
+              $REBOOT = Read-Host -Prompt 'Do you wish to use this layout? Y/N'
+              If ($REBOOT -EQ 'N'){
+                Remove-Item $CVTlocator
+                Copy-Item "$($mirus)00-PROGRAMS\BACKUPS\MLC.MLC" -Destination "$CVTlocator"
+            continue}}
+            Clear-Host
+            Write-Output -InputObject "$($mirus)00-PROGRAMS\MLC.MLC has been configured and will now run."
+            Write-Output -InputObject ''
+            $escape_mirus = '--%'
+            $mirus_parameters1 = $root + '00-PROGRAMS\MLC.MLC'
+            $mirus_parameters2 = $Path + $Files.BaseName + '.CVT*' + $CRLF
+            $mirus_parameters3 = $Path + $Files.BaseName + '.000'
+            MIRUSLC.EXE $escape_mirus $mirus_parameters1 1 $mirus_parameters2 $mirus_parameters3
+            $INPUT_COUNT = NCOA_BAD($Path + $Files.BaseName + '.CVT')
+            $script:INPUT_RECORDS += $INPUT_COUNT
+            while (!(Test-Path "$Path$($fILES.BaseName).000")) { Start-Sleep -Milliseconds 1200 }
+            [ARRAY]$INPUT_COUNTER += "$($Files.BaseName).CVT has been run through Mirus 206 and List Convert with $INPUT_COUNT records."
+            Copy-Item "$CVTLocator" -Destination "$($CVTLocator).sav"
+            Remove-Item $CVTlocator
+            Copy-Item "$($CVTlocator).bak" -Destination "$CVTlocator"
+            Remove-Item "$($CVTlocator).bak"
+            $redo = 1
+            $completed_file_counter++
+          } 
+        }
+        $MLC = 1
+      }
+  $cnt = $Path + '*.cnt'
+  $cct = $Path + '*.cct'
+  Remove-Item $cnt
+  Remove-Item $cct
+  Write-Output -InputObject $INPUT_COUNTER
+  Write-Output -InputObject ''
+  Read-Host -Prompt 'Mirus 206 and List Convert are complete, data is prepared. Press enter to continue'
+  $script:checklist3 = 'COMPLETE'
+  #    RESTORE ORIGINAL MIRUS ROOT
+  $env:Mirus_Active_Directory = $root
+  Clear-Host
+}
+
+Function CASS
+{
+  Clear-Host
+  $combine = Read-Host -Prompt 'Do you have multiple input files? Y/N'
+  $mirus = $env:Mirus_Active_Directory
+  $Path = $mirus + 'XX-WORKING\'
+  $zp4 = Get-Content -Path "$mirus\00-PROGRAMS\CASS.zp4"
+  $i = 0
+  $biggestcrlf = @()
+  If ($combine -eq 'Y'){
+    Clear-Host
+    Write-Output -InputObject 'Combining your input files now.'
+    Write-Output -InputObject ''
+    Write-Output -InputObject 'Preparing your files for CASS.'
+    Write-Output -InputObject ''
+    Get-Content -Path "$Path*.000" | Set-Content -Path "$Path$job_number.000"
+    Copy-Item -Path "$Path$job_number.000" -Destination "$mirus$job_number.000"
+    Remove-Item -Path "$Path*.000"
+    Copy-Item -Path "$mirus$job_number.000" -Destination "$Path$job_number.000"
+    Remove-Item -Path "$mirus$job_number.000"
+    Write-Output -InputObject 'All files have been combined to run as a single CASS.'
+    Write-Output -InputObject ''
+    Read-Host -Prompt 'Press enter to begin CASS'
+    }
+    Else{ 
+    Get-Content -Path "$Path*.000" | Set-Content -Path "$mirus$job_number.000"
+    Remove-Item -Path "$Path*.000"
+    Copy-Item -Path "$mirus$job_number.000" -Destination "$Path$job_number.000"
+    Remove-Item -Path "$mirus$job_number.000" }    
+  $CRFILE = "$Path$job_number.000"
+  $CRLF = FIND_CRLF($CRFILE)
+  Write-Output -InputObject ''
+  Write-Output -InputObject "Your CRLF is located at $CRLF."
+  Write-Output -InputObject ''
+  Get-ChildItem -Path $Path -Filter '*.000' | ForEach-Object -Process {
+    $inputfile = $_.FullName
+    $outputfile = $_.BaseName + '.CAS'
+    $env:Mirus_Active_Directory = $Path
+    $env:Mirus_Active_Directory = $Path
+    $casslocator = "$($mirus)00-PROGRAMS\CASS.zp4"
+    Copy-Item $casslocator -Destination "$($casslocator).bak"
+    $casszp4 = @()
+    $casszp4 += $zp4[0..2]
+    $casszp4 += $zp4[3]  -replace 'INPUT FILE=', "INPUT FILE=$inputfile"
+    Write-Output -InputObject "INPUT FILE=$inputfile"
+    $casszp4 += $zp4[4..6]
+    $casszp4 += $zp4[7] -replace 'OUTPUT FILE=', "OUTPUT FILE=$Path$outputfile"
+    Write-Output -InputObject "OUTPUT FILE=$Path$outputfile"
+    $casszp4 += $zp4[8..20]
+    $casszp4 += $zp4[21] -replace 'INPUT RECORD SIZE=', "INPUT RECORD SIZE=$CRLF"
+    $casszp4 += $zp4[22] -replace 'OUTPUT RECORD SIZE=', "OUTPUT RECORD SIZE=$CRLF"
+    $casszp4 += $zp4[23..26]
+    $casszp4 += $zp4[27] -replace 'REPORT TITLE=', "REPORT TITLE=$job_number"
+    Write-Output -InputObject "REPORT TITLE=$job_number"
+    $casszp4 += $zp4[28..107]
+    $casszp4 += $zp4[108] -replace 'ACTIVE DIRECTORY=', "ACTIVE DIRECTORY=$Path"
+    Write-Output -InputObject "ACTIVE DIRECTORY=$Path"
+    $casszp4 += $zp4[109..($zp4.count -2)]
+    $casszp4 | Out-File -FilePath "$mirus\00-PROGRAMS\CASS.zp4" -Encoding default
+    Write-Output -InputObject ''
+    Write-Output -InputObject "$($mirus)00-PROGRAMS\CASS.zp4 has been configured and will now run."
+    C:\Anchor\GMIRZP4D.EXE $casslocator
+    Write-Output -InputObject ''
+    Read-Host -Prompt 'Press enter when CASS is complete'
+    Remove-Item -Path "$($Path)*CASSDATE"
+    Remove-Item -Path "$($Path)*.LOG"
+    Remove-Item -Path "$($Path)*.HTML"
+    Remove-Item -Path "$($Path)*.FLG"
+    Remove-Item -Path "$($Path)*.CFG"
+    Remove-Item -Path "$($Path)ERROR*"
+    Remove-Item $casslocator
+    Copy-Item -Path "$($casslocator).bak" -Destination "$casslocator"
+    Remove-Item -Path "$($casslocator).bak"
+    New-Item "$($Path)NCOA\" -type directory
+    Copy-Item -Path $Path$outputfile -Destination "$($Path)NCOA\"
+    Clear-Host
+    $checklist4 = 'COMPLETE'
+    $CASS_COUNT = NCOA_BAD("$Path$($job_number).CAS")
+    $script:CASS_RECORDS += $CASS_COUNT
+    Write-Output -InputObject 'CASS is complete for all data.'
+    $env:Mirus_Active_Directory = $mirus
+    Clear-Host
+    Invoke-Item C:\Anchor\gmirzp4D.exe
+    Write-Output 'Please print your CASS report to PDF now.'
+    Write-Output ''
+    Read-Host 'Press enter when you are ready to move on'
+    Clear-Host
+    Menu
+  }
+} 
+Function NCOA
+{
+  $mirus = $env:Mirus_Active_Directory
+  $Path = $mirus + 'XX-WORKING\'
+  $fileanswer = 'FILE STILL NOT FOUND'
+  $RTJ = Get-Content -Path "$mirus\00-PROGRAMS\NCOA_RETURN_REJECT.MDU"
+  $NCOALocator = "$($mirus)00-PROGRAMS\NCOA.zp4"
+  $CRLF = 0
+  $Year = (Get-Date -Year);$Month = (Get-Date -Month);$Day = (Get-Date -Day);
+  Clear-Host
+  Write-Output -InputObject 'Beginning the NCOA process...'
+  Write-Output -InputObject ''
+  Write-Output -InputObject 'Preparing configuration files...'
+  Get-ChildItem -Path $Path -Filter '*.CAS' | ForEach-Object -Process {
+    $workingfolder = "C:\Jobs\$($job_number)"
+    $inputfile = "C:\Jobs\$($job_number)\$($job_number).CAS"
+    $outputfile = "C:\Jobs\$($job_number)\$($job_number)_NCOA.OUT"
+    $CRFILE = "$Path$job_number.CAS"
+    $CRLF = FIND_CRLF($CRFILE)
+    $NCOA = Get-Content -Path "$mirus\00-PROGRAMS\NCOA.zp4"
+    Copy-Item -Path $NCOAlocator -Destination "$($NCOALocator).bak"
+    $NCOAzp4 = @()
+    $NCOAzp4 += $NCOA[0..3]
+    $NCOAzp4 += $NCOA[4]  -replace 'INPUT FILE=', "INPUT FILE= $inputfile"
+    Write-Output -InputObject "INPUT FILE= $inputfile"
+    $NCOAzp4 += $NCOA[5..6]
+    $NCOAzp4 += $NCOA[7]  -replace 'OUTPUT FILE=', "OUTPUT FILE= $outputfile"
+    Write-Output -InputObject "OUTPUT FILE= $outputfile"
+    $NCOAzp4 += $NCOA[8..23]
+    $NCOAzp4 += $NCOA[24]  -replace 'INPUT RECORD SIZE=', "INPUT RECORD SIZE= $CRLF"
+    Write-Output -InputObject "INPUT RECORD SIZE= $CRLF"
+    $NCOAzp4 += $NCOA[25..61]
+    $NCOAzp4 += $NCOA[62]  -replace 'NCOA FILE RECEIVED =', "NCOA FILE RECEIVED = $month - $day - $year"
+    $NCOAzp4 += $NCOA[63]  -replace 'NCOA FILE RETURNED DATE=', "NCOA FILE RETURNED DATE= $month - $day - $year"
+    $NCOAzp4 += $NCOA[64]  -replace 'LIST NAME=', "LIST NAME= $job_number"
+    Write-Output -InputObject "LIST NAME= $job_number"
+    $NCOAzp4 += $NCOA[65..70]
+    $NCOAzp4 += $NCOA[71]  -replace 'DEFAULT NCOA REPORT PATH=', "DEFAULT NCOA REPORT PATH= $($workingfolder)\"
+    Write-Output -InputObject "DEFAULT NCOA REPORT PATH= $workingfolder"
+    $NCOAzp4 += $NCOA[72..117]
+    $NCOAzp4 += $NCOA[118]  -replace 'ACTIVE DIRECTORY =', "ACTIVE DIRECTORY = $($workingfolder)\"
+    Write-Output -InputObject "ACTIVE DIRECTORY = $($workingfolder)\"
+    $NCOAzp4 += $NCOA[119..183]
+    $NCOAzp4 += $NCOA[184]  -replace 'NCOA AUDIT REPORT NAME =', "NCOA AUDIT REPORT NAME = $($workingfolder)\ncoaauditreport.csv"
+    Write-Output -InputObject "NCOA AUDIT REPORT NAME = $($workingfolder)\ncoaauditreport.csv"
+    $NCOAzp4 += $NCOA[185..($NCOA.count -1)]
+    $NCOAzp4 | Out-File -FilePath "$mirus\00-PROGRAMS\NCOA.zp4" -Encoding default
+    Write-Output -InputObject ''
+    Write-Output -InputObject 'NCOA configuration is complete.'
+  }
+  Write-Output -InputObject ''
+  Read-Host -Prompt 'Press enter to continue'
+  Clear-Host
+  
+  #    Compress the files for transfer.
+  Copy-Item -Path $NCOALocator -Destination "$($Path)NCOA\"
+  Add-Type -AssemblyName 'system.io.compression.filesystem'
+  [io.compression.zipfile]::CreateFromDirectory("$($Path)\NCOA", "$Path$($job_number).zip")
+  Remove-Item -Path "$($Path)NCOA\" -Recurse
+  Write-Output -InputObject "Your zip is ready at $Path$($job_number).zip"
+  Write-Output -InputObject ''
+  Write-Output -InputObject "Your control book, $($job_number).zp4, is included in the zip archive."
+  Write-Output -InputObject ''
+  Write-Output -InputObject 'Please ensure that the files are returned to \XX-WORKING\'
+  Invoke-Item $Path
+  
+  #    RDP OUT
+  mstsc.exe /v '64.244.178.14:7816' /f
+ 
+  Write-Output -InputObject ''
+  Read-Host -Prompt 'Press enter when you are done with NCOA'
+  Clear-Host
+  Write-Output -InputObject 'Welcome back from NCOA. Did you bring the files back into /XX-WORKING/ ?'
+  $confirm = Read-Host -Prompt 'Y/N'
+  If ($confirm -ne 'Y'){Read-Host -Prompt 'Press enter once you have moved the files.'}
+  $testpath = Test-Path "$($Path)ncoasummaryrpt.zip"
+  If ($testpath -eq $TRUE){$fileanswer = "$($Path)ncoasummaryrpt.zip"
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+  [System.IO.Compression.ZipFile]::ExtractToDirectory($fileanswer, $Path)}
+  $testpath2 = Test-Path "$Path$($job_number)_NCOA.zip"
+  If ($testpath2 -eq $TRUE){$fileanswer = "$Path$($job_number)_NCOA.zip"
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+  [System.IO.Compression.ZipFile]::ExtractToDirectory($fileanswer, $Path)}
+  $testpath3 = Test-Path "$Path$($job_number)_NCOA.OUT"
+  If ($testpath3 -eq $TRUE){$fileanswer = "$Path$($job_number)_NCOA.OUT"}
+  Clear-Host
+  Write-Output -InputObject "Okay, I see that $fileanswer is in the right place."
+  Read-Host -Prompt 'Press enter to begin the NCOA return process.'
+  Remove-Item -Path $NCOALocator
+  Copy-Item -Path "$($NCOALocator).bak" -Destination $NCOALocator
+  Remove-Item -Path "$($NCOALocator).bak"
+  #  SET
+    Get-ChildItem -Path $Path -Filter '*NCOA.OUT' | ForEach-Object -Process {
+      $CRFILE = "$Path$job_number.CAS"
+      $CRLF = FIND_CRLF($CRFILE)
+      $inputfile = $_.FullName
+      $outputfile = $_.BaseName + '.DAT'
+      $rejectfile = $_.BaseName + '.BAD'
+      $env:Mirus_Active_Directory = $Path
+      $env:Mirus_Active_Directory = $Path
+      $RTJlocator = "$($mirus)00-PROGRAMS\NCOA_RETURN_REJECT.MDU"
+      Copy-Item $RTJlocator -Destination "$($RTJlocator).bak"
+      $NCOA_RTJ = @()
+      $NCOA_RTJ += $RTJ[0]
+      $NCOA_RTJ += $RTJ[1]  -replace ';INPUT FILE=', ";INPUT FILE=$inputfile"
+      Write-Output -InputObject "INPUT FILE=$inputfile"
+      $NCOA_RTJ += $RTJ[2..4]
+      $NCOA_RTJ += $RTJ[5]  -replace ';REJECTED FILE=', ";REJECTED FILE=$Path$rejectfile"
+      Write-Output -InputObject "REJECT FILE=$rejectfile"
+      $NCOA_RTJ += $RTJ[6]
+      $NCOA_RTJ += $RTJ[7]  -replace ';SELECTED FILE=', ";SELECTED FILE=$Path$outputfile"
+      Write-Output -InputObject "OUTPUT FILE=$outputfile"
+      $NCOA_RTJ += $RTJ[8..12]
+      $NCOA_RTJ += $RTJ[13]  -replace ';ACTIVE_DIRECTORY=', ";ACTIVE_DIRECTORY=$Path"
+      Write-Output -InputObject "ACTIVE DIRECTORY=$Path"
+      $NCOA_RTJ += $RTJ[14..123]
+      $NCOA_RTJ += $RTJ[124]  -replace 'GENERATE CONSTANT IN POSITION XXX THRU 700', "GENERATE CONSTANT IN POSITION $CRLF THRU 700"
+      Write-Output -InputObject ''
+      Write-Output -InputObject "YOUR CRLF IS $CRLF AND I WILL WIPE OUT ALL EXTRA NCOA DATA AFTER IT."
+      $NCOA_RTJ += $RTJ[125..($RTJ.count -1)]
+      $NCOA_RTJ | Out-File -FilePath "$mirus\00-PROGRAMS\NCOA_RETURN_REJECT.MDU" -Encoding default
+      #  DO
+      $env:Mirus_Active_Directory = $Path
+      $escape_mirus = '--%'
+      $mirus_parameters1 = $mirus + '00-Programs\NCOA_RETURN_REJECT.MDU'
+      $mirus_parameters2 = $Path + $job_number + '_NCOA.OUT*1634'
+      $mirus_parameters3 = $Path + $job_number + '.DAT*700'
+      $mirus_parameters4 = $Path + $job_number + '_NCOA.BAD*1634'
+      MIRUSDU $escape_mirus $mirus_parameters1 $mirus_parameters2 $mirus_parameters3 $mirus_parameters4
+      Write-Output -InputObject ''
+      Read-Host -Prompt 'Press enter when NCOA is complete.'
+      Remove-Item $RTJlocator
+      Copy-Item -Path "$($RTJlocator).bak" -Destination "$RTJlocator"
+      Remove-Item -Path "$($RTJlocator).bak"
+      #  DONE    
+      $checklist5 = 'COMPLETE'
+    }
+   $CRFILE = "$Path$($job_number)_NCOA.BAD"
+   $script:BAD_RECORDS = NCOA_BAD($CRFILE)
+   $NCOA_COUNT = NCOA_BAD("$Path$($job_number)_NCOA.OUT")
+   $NCOA_COUNT -= $BAD_RECORDS
+   $script:NCOA_RECORDS += $NCOA_COUNT
+   Clear-Host
+   Write-Output -InputObject "There are $NCOA_COUNT total records that were corrected by NCOA." 
+   Write-Output -InputObject "There are $BAD_RECORDS total records that were rejected by NCOA."
+   Read-Host -Prompt 'Return/Reject is complete for NCOA. Please check your files before pressing enter'
+   $env:Mirus_Active_Directory = $mirus
+   Clear-Host
+  Menu
+}
+
+function REFORMAT
+{
+  Clear-Host
+  $mirus = $env:Mirus_Active_Directory
+  $Path = $mirus + 'XX-WORKING\'
+  $RFM = Get-Content -Path "$mirus\00-PROGRAMS\REFORMAT.MDU"
+  $confirm = 'N'
+  $sequence = 0
+  $218locator = "$mirus\00-PROGRAMS\REFORMAT.MDU"
+  $i = 0
+  $i2 = 0
+  $i3 = 243
+  $i4 = 0
+  $SKIP = $FALSE
+  $min = 0
+  $max = 0
+  $SAL1=47;$SAL2=48;$SAL3=49;$CMP=50;$AMT1=71;$AMT2=74;$AMT3=77;$AMT4=80;$AMT5=83;$SC=88;$ID=89;
+  Write-Output -InputObject 'We are now reformatting the file into our standard layout.'
+  Write-Output -InputObject ''
+  Write-Output -InputObject 'Please do not open any files until requested.'
+  Write-Output -InputObject ''
+  #    PREPARE
+  Get-ChildItem -Path $Path -Filter '*.DAT' | ForEach-Object -Process {
+    $header = (Get-Content "$Path$($_.BaseName).DAT" -First 1)
+    $CRFILE = $_.FullName
+    $CRLF = FIND_CRLF($CRFILE)
+    $REFORMAT_MAX = $CRLF + 1000
+    $inputfile = $_.FullName
+    $outputfile = $_.BaseName + '.RFM'
+    $rejectfile = $_.BaseName + '.RJT'
+    $env:Mirus_Active_Directory = $Path
+    $INC_IDENT = ''
+    $RFMconvert = @()
+    $RFMconvert = (0..(($includetracker[$job_number].count)-1))
+      For ($i = 0;$i -lt $includetracker[$job_number].count;$i++){
+        Clear-Host
+        $INC_VALUE = $($includetracker[$job_number][$i])
+        [int]$intNum1 = [convert]::ToInt32($($INC_VALUE.substring(0,4)), 10)
+        [int]$intNum2 = [convert]::ToInt32($($INC_VALUE.substring(5,4)), 10)
+        Write-Output -InputObject 'Please define your includes before continuing.'
+        Write-Output -InputObject ''
+        Write-Output -InputObject "You are working on: $($_.FullName)"
+        Write-Output -InputObject ''
+        Write-Output -InputObject "Include = $($header[($i3-1)..($i3-1+$intNum2-$intNum1)])"
+        Write-Output -InputObject ''
+        Write-Output -InputObject 'Options = SAL1, SAL2, SAL3, CMP, AMT1, AMT2, AMT3, AMT4, AMT5, SC, ID'
+        Write-Output -InputObject ''
+        $INC_IDENT = Read-Host -Prompt 'Please assign this line or hit enter to skip.'
+        If ($INC_IDENT -eq ''){$temp_array = @()
+          Foreach ($item in $includetracker[$job_number]){
+            If ($item -ne $INC_VALUE){
+              $temp_array += $item
+            }
+          }
+        $i - 1
+        $includetracker[$job_number] = $temp_array
+        }
+        Else{$RFMconvert[$i] = Get-Variable $INC_IDENT -ValueOnly;$includetracker[$job_number][$i] = "1$i3-1$($i3+$intNum2-$intNum1)";$i3 = ($i3+$intNum2-$intNum1+4)}
+      }
+    Clear-Host
+    $env:Mirus_Active_Directory = $Path
+    $RFMlocator = "$($mirus)00-PROGRAMS\REFORMAT.MDU"
+      Copy-Item $RFMlocator -Destination "$($RFMlocator).bak"
+      $RFM_FIX = @()
+      $RFM_FIX += $RFM[0]
+      $RFM_FIX += $RFM[1]  -replace ';INPUT FILE=', ";INPUT FILE=$inputfile"
+      Write-Output -InputObject "INPUT FILE=$inputfile"
+      $RFM_FIX += $RFM[2]  -replace ';INPUT RECORD SIZE=', ";INPUT RECORD SIZE=$CRLF"
+      $RFM_FIX += $RFM[3..4]
+      $RFM_FIX += $RFM[5]  -replace ';REJECTED FILE=', ";REJECTED FILE=$Path$rejectfile"
+      Write-Output -InputObject "REJECT FILE=$rejectfile"
+      $RFM_FIX += $RFM[6]
+      $RFM_FIX += $RFM[7]  -replace ';SELECTED FILE=', ";SELECTED FILE=$Path$outputfile"
+      Write-Output -InputObject "OUTPUT FILE=$outputfile"
+      $RFM_FIX += $RFM[8..11]
+      $RFM_FIX += $RFM[12]  -replace ';ACTIVE_DIRECTORY=', ";ACTIVE_DIRECTORY=$Path"
+      Write-Output -InputObject "ACTIVE DIRECTORY=$Path"
+      $RFM_FIX += $RFM[13..16]
+      $RFM_FIX += $RFM[17]  -replace 'RR', "R 0001-$CRLF;1001-$REFORMAT_MAX"
+      $RFM_FIX += $RFM[18..27]
+      Write-Output ''
+      $confirm = Read-Host -Prompt 'Do you wish to use sequence numbers on this job? Y/N'
+      If ($confirm -eq 'Y'){
+        $RFM_FIX += $RFM[28]  -replace 'PUT', ';PUT'
+        Write-Output ''
+        $sequence = Read-Host -Prompt 'Please enter your new sequence number:'
+        $RFM_FIX += $RFM[29]  -replace 'MDUS021 001 THRU 009', "MDUS021 001 THRU 009 $sequence"
+        }
+        Else{
+        $RFM_FIX += $RFM[28]  -replace 'PUT', ';PUT'
+        $RFM_FIX += $RFM[29]  -replace 'MDUS021 001 THRU 009', ';MDUS021 001 THRU 009'
+        }
+    #    Sort the list of includes least to greatest.  
+    While ($i2 -ne ($includetracker[$job_number].count)){
+      $i2 = 1
+        For ($i = 0;$i -lt ($includetracker[$job_number].count-1);$i++){
+          If ($RFMconvert[$i] -gt $RFMconvert[$i+1]){
+            $temp = $RFMconvert[$i+1];$RFMconvert[$i+1] = $RFMconvert[$i];$RFMconvert[$i] = $temp
+            $temp2 = $includetracker[$job_number][$i+1];$includetracker[$job_number][$i+1] = $includetracker[$job_number][$i];$includetracker[$job_number][$i] = $temp2}
+          Else {$i2++}
+          }
+        } 
+      $i = 0
+      $RFM_FIX += $RFM[30..46]
+      If ($RFMconvert[$i] -eq 47){$RFM_FIX += $RFM[47]  -replace 'R 0000-0000', "R $($includetracker[$job_number][$i])";$i++}Else{$RFM_FIX += $RFM[47]}
+      If ($RFMconvert[$i] -eq 48){$RFM_FIX += $RFM[48]  -replace 'R 0000-0000', "R $($includetracker[$job_number][$i])";$i++}Else{$RFM_FIX += $RFM[48]}
+      If ($RFMconvert[$i] -eq 49){$RFM_FIX += $RFM[49]  -replace 'R 0000-0000', "R $($includetracker[$job_number][$i])";$i++}Else{$RFM_FIX += $RFM[49]}
+      If ($RFMconvert[$i] -eq 50){$RFM_FIX += $RFM[50]  -replace 'R 0000-0000', "R $($includetracker[$job_number][$i])";$i++}Else{$RFM_FIX += $RFM[50]}
+      $RFM_FIX += $RFM[51..70]
+      If ($RFMconvert[$i] -eq 71){$RFM_FIX += $RFM[71]  -replace 'R 0000-0000', "R $($includetracker[$job_number][$i])";$i++}Else{$RFM_FIX += $RFM[71]}
+      $RFM_FIX += $RFM[72..73]
+      If ($RFMconvert[$i] -eq 74){$RFM_FIX += $RFM[74]  -replace 'R 0000-0000', "R $($includetracker[$job_number][$i])";$i++}Else{$RFM_FIX += $RFM[74]}
+      $RFM_FIX += $RFM[75..76]
+      If ($RFMconvert[$i] -eq 77){$RFM_FIX += $RFM[77]  -replace 'R 0000-0000', "R $($includetracker[$job_number][$i])";$i++}Else{$RFM_FIX += $RFM[77]}
+      $RFM_FIX += $RFM[78..79]
+      If ($RFMconvert[$i] -eq 80){$RFM_FIX += $RFM[80]  -replace 'R 0000-0000', "R $($includetracker[$job_number][$i])";$i++}Else{$RFM_FIX += $RFM[80]}
+      $RFM_FIX += $RFM[81..82]
+      If ($RFMconvert[$i] -eq 83){$RFM_FIX += $RFM[83]  -replace 'R 0000-0000', "R $($includetracker[$job_number][$i])";$i++}Else{$RFM_FIX += $RFM[83]}
+      $RFM_FIX += $RFM[84..87]
+      If ($RFMconvert[$i] -eq 88){$RFM_FIX += $RFM[88]  -replace 'R 0000-0000', "R $($includetracker[$job_number][$i])";$i++}Else{$RFM_FIX += $RFM[88]}
+      If ($RFMconvert[$i] -eq 89){$RFM_FIX += $RFM[89]  -replace 'R 0000-0000', "R $($includetracker[$job_number][$i])";$i++}Else{$RFM_FIX += $RFM[89]}
+      $RFM_FIX += $RFM[90..($RFM.count -1)]
+      Clear-Host
+      Write-Output 'Your includes have been written to a control book.'
+      Write-Output ''
+      Read-Host -Prompt 'Press enter to automatically adjust field lengths in RFM and 218 control'
+      Clear-Host
+      $RFM_FIX | Out-File -FilePath "$mirus\00-PROGRAMS\REFORMAT.MDU" -Encoding default
+      #  DO
+      Clear-Host
+      Write-Output -InputObject 'Your REFORMAT.MDU has been configured.'
+      Write-Output ''
+      #Write-Output -InputObject 'Before you continue, please check your INCLUDES in the REFORMAT.MDU MOVES list.'
+      #Invoke-Item "$($mirus)00-PROGRAMS\REFORMAT.MDU"
+      #Invoke-Item "$($_.FullName)"
+      #Write-Output -inputobject ''
+      Read-Host -Prompt 'Press enter to run Reformat'
+      $env:Mirus_Active_Directory = $Path
+      $escape_mirus = '--%'
+      $mirus_parameters1 = $mirus + '00-Programs\REFORMAT.MDU'
+      $mirus_parameters2 = $Path + $job_number + ".DAT*$CRLF"
+      $mirus_parameters3 = $Path + $job_number + '.RFM*1000'
+      $mirus_parameters4 = $Path + $job_number + '.RJT*1000'
+      MIRUSDU $escape_mirus $mirus_parameters1 $mirus_parameters2 $mirus_parameters3 $mirus_parameters4
+      Clear-Host
+      Read-Host 'Press enter once your REFORMAT is complete'
+      Clear-Host
+      $RFM_COUNT = NCOA_BAD("$Path$($job_number).RFM")
+      $script:RFM_RECORDS += $RFM_COUNT
+      $CRFILE = "$Path$($job_number).RJT"
+      $script:BAD_RECORDS += NCOA_BAD($CRFILE)
+      Write-Output -InputObject "Reformat processed with a result of $RFM_RECORDS records."
+      Write-Output ''
+      Write-Output -InputObject "$BAD_RECORDS records were rejected during the reformat."
+      Write-Output ''
+      Read-Host -Prompt 'Press enter to begin the 218 fixed-width to variable data conversion'
+      Clear-Host
+      $mirus_parameters1 = $mirus + '00-Programs\218.CTL'
+      $mirus_parameters2 = $Path + $job_number + ".RFM*1000"
+      $mirus_parameters3 = $Path + $job_number + '.TAB'
+      $mirus_parameters4 = "`"NOQUOTES`""
+      $mirus_parameters5 = "`"NOTFIXED`""
+      $mirus_parameters6 = "`"09`""
+      $mirus_parameters7 = "`"HEADERRECORD`""
+      MIRUS218 $escape_mirus $mirus_parameters1 $mirus_parameters2 $mirus_parameters3 $mirus_parameters4 $mirus_parameters5 $mirus_parameters6 $mirus_parameters7
+      Start-Sleep -Milliseconds 500
+      Write-Output -InputObject "Created $Path$($job_number).TAB for Laser."
+      Write-Output ''
+      Read-Host -Prompt 'JOB is complete. Press enter when you are ready to move on'
+      Remove-Item $RFMlocator
+      Copy-Item -Path "$($RFMlocator).bak" -Destination "$RFMlocator"
+      Remove-Item -Path "$($RFMlocator).bak"
+    } 
+    $checklist6 = 'COMPLETE'
+    $env:Mirus_Active_Directory = $mirus
+    Clear-Host
+    Menu
+}
+
+function FINALIZE
+{
+  Clear-Host
+  Write-Output 'Copying files out...'
+  $mirus = $env:Mirus_Active_Directory
+  $Path = $mirus + 'XX-WORKING\'
+  New-Item -ItemType directory -Path $Path$job_number
+  New-Item -ItemType directory -Path "$Path$($job_number)\ORG CLIENT FILES"
+  New-Item -ItemType directory -Path "$Path$($job_number)\INPUT"
+  New-Item -ItemType directory -Path "$Path$($job_number)\CASS"
+  New-Item -ItemType directory -Path "$Path$($job_number)\NCOA"
+  New-Item -ItemType directory -Path "$Path$($job_number)\REFORMAT"
+  
+  Clear-Host
+  Copy-Item -Path "$($Path)ncoasummaryrpt.html" -Destination "$Path$($job_number)\NCOA\$($Path)ncoasummaryrpt.html"
+  Copy-Item -Path "$($Path)NCOARETURN.TXT" -Destination "$Path$($job_number)\NCOA\NCOARETURN.TXT"
+  Copy-Item -Path "$($Path)ncoasummaryrpt.zip" -Destination "$Path$($job_number)\NCOA\$($Path)ncoasummaryrpt.zip"
+  Copy-Item -Path "$($Path)$($job_number).zip" -Destination "$Path$($job_number)\NCOA\$($job_number).zip"
+  Copy-Item -Path "$($Path)$($job_number)_NCOA.OUT" -Destination "$Path$($job_number)\NCOA\$($job_number)_NCOA.OUT"
+  Copy-Item -Path "$($Path)$($job_number)_NCOA.BAD" -Destination "$Path$($job_number)\NCOA\$($job_number)_NCOA.BAD"
+  Copy-Item -Path "$($Path)$($job_number).DAT" -Destination "$Path$($job_number)\NCOA\$($job_number).DAT"
+  Copy-Item -Path "$($Path)$($job_number).000" -Destination "$($Path)$($job_number)\INPUT\$($job_number).000"
+  Copy-Item -Path "$($Path)cass.rpt" -Destination "$($Path)$($job_number)\CASS\cass.rpt"
+  Remove-Item -Path "$($Path)$($job_number)cass.rpt"
+  Copy-Item -Path "$($Path)cassdate.000" -Destination "$($Path)$($job_number)\CASS\cassdate.000"
+  Copy-Item -Path "$($Path)$($job_number).CAS" -Destination "$Path$($job_number)\CASS\$($job_number).CAS"
+  Foreach ($File in (Get-ChildItem -Path $Path -Filter '*.csv')){
+    Copy-Item -Path $File.FullName -Destination "$Path$($job_number)\INPUT\$($File.BaseName).csv"
+    Copy-Item -Path "$($Path)$($File.BaseName).CVT" -Destination "$Path$($job_number)\INPUT\$($File.BaseName).CVT"
+    Copy-Item -Path "$($Path)$($File.BaseName).RPT" -Destination "$Path$($job_number)\INPUT\$($File.BaseName).RPT"
+    }
+  Copy-Item -Path "$($Path)$($job_number).RFM" -Destination "$($Path)$($job_number)\REFORMAT\$($job_number).RFM"
+  Copy-Item -Path "$($Path)$($job_number).RJT" -Destination "$($Path)$($job_number)\REFORMAT\$($job_number).RJT"
+  Copy-Item -Path "$($Path)$($job_number).TAB" -Destination "$($Path)$($job_number)\$($job_number).TAB"
+   Foreach ($File in (Get-ChildItem -Path $mirus -filter '*.xls'))
+   {
+     Copy-Item -Path $File.Fullname -Destination "$($Path)$($job_number)\ORG CLIENT FILES\"
+     Remove-Item -Path $File.FullName
+   }
+   Foreach ($File in (Get-ChildItem -Path $mirus -filter '*.xlsx'))
+   {
+     Copy-Item -Path $File.Fullname -Destination "$($Path)$($job_number)\ORG CLIENT FILES\"
+     Remove-Item -Path $File.FullName
+   }
+   Foreach ($File in (Get-ChildItem -Path $mirus -filter '*.tab'))
+   {
+     Copy-Item -Path $File.Fullname -Destination "$($Path)$($job_number)\ORG CLIENT FILES\"
+     Remove-Item -Path $File.FullName
+   }
+   Foreach ($File in (Get-ChildItem -Path $mirus -filter '*.csv'))
+   {
+     Copy-Item -Path $File.Fullname -Destination "$($Path)$($job_number)\ORG CLIENT FILES\"
+     Remove-Item -Path $File.FullName
+   }
+  Copy-Item -Path "$($Path)$($job_number)\" -Destination "\\ENGAGESTS1\Elements\Prospect Jobs\Conversions\03-Other Outside Jobs\$($job_number)" -Recurse
+  Clear-Host
+  Menu
+}
+function FIND_CRLF($CRLF)
+{
+  $CRLF = ConvertTo-String $CRLF
+  $FOUNDCRLF = [regex]::match("$CRLF","`n")
+  $POSITION = $FOUNDCRLF.Index
+  $POSITION += 1
+  return $POSITION
+}
+function NCOA_BAD($CRLF)
+{
+  $TOTAL = 0
+  $CRLF = ConvertTo-String $CRLF
+  [regex]$FOUNDCRLF = "`r`n"
+  $match = $FOUNDCRLF.Match($CRLF)
+  while ($match.Success) {
+    $TOTAL++ | out-null
+    $match = $match.NextMatch()
+  } 
+  return $TOTAL
+}
+
+# ----------------------
+#    MENU SCREEN
+# ----------------------
+function Menu
+{
+  #Clear-Host
+  If ($checklist1 -eq 'COMPLETE'){$Path = "$($mirus)XX-WORKING\"}
+  If ($checklist1 -eq 'ERROR')
+  {
+    Write-Output -InputObject 'You must set your active directory before proceeding.'
+  }
+  Write-Output -InputObject 'Please select an option from the menu below.'
+  Write-Output -InputObject ''
+  Write-Output -InputObject "Input Records = $INPUT_RECORDS"
+  Write-Output -InputObject "CASS Records = $CASS_RECORDS"
+  Write-Output -InputObject "NCOA Records = $NCOA_RECORDS"
+  Write-Output -InputObject "Rejected Records = $BAD_RECORDS"
+  Write-Output -InputObject "Reformat Records = $RFM_RECORDS"
+  Write-Output -InputObject ''
+  Write-Output -InputObject 'Menu:'
+  Write-Output -InputObject "1: Active Directory [$checklist1]"
+  Write-Output -InputObject "2: Job Number       [$checklist2]"
+  Write-Output -InputObject "3: Prepare Files    [$checklist3]"
+  Write-Output -InputObject "4: CASS             [$checklist4]"
+  Write-Output -InputObject "5: NCOA             [$checklist5]"
+  Write-Output -InputObject "6: Reformat         [$checklist6]"
+  Write-Output -InputObject "7: Finalize         [$checklist7]"
+  Write-Output -InputObject "0: TESTING"
+  Write-Output -InputObject ''
+
+  
+  $menuoption = Read-Host -Prompt 'Please type the number of a menu item'
+  If ($menuoption -eq 1)
+  {
+    MIRUS_ENVIRONMENT
+  }
+  If ($menuoption -eq 2)
+  {
+    JOB_SELECT
+  }
+  If ($menuoption -eq 3)
+  {
+    PREPARE_FILES
+    Menu
+  }
+  If ($menuoption -eq 4)
+  {
+    CASS
+  }
+  If ($menuoption -eq 5)
+  {
+    NCOA
+  }
+  If ($menuoption -eq 6)
+  {
+    REFORMAT
+  }
+  If ($menuoption -eq 7)
+  {
+    FINALIZE
+  }
+  If ($menuoption -eq 0)
+  {
+    Foreach ($Files in (Get-ChildItem -Path $Path -Filter '*.rpt')){Write-Output -InputObject $includetracker[$files.basename]
+    READ-HOST -prompt '?'}
+    MENU
+  }
+}
+# ----------------------
+#    INITIALIZE SCRIPT
+# ----------------------
+Clear-Host
+Menu
+
