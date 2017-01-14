@@ -3,7 +3,7 @@
 NOTE: This will not run on your computer without Anchor Software!
 
 The goal of this script was to learn how to write Powershell.
-The function of this script is to automatically produce scripts in the language of Anchor, for the purpose of re-mapping fields in data files via byte level manipulation.
+The function of this script is to automatically produce scripts in the language of Anchor, for the purpose of re-mapping fields in flat files via byte level manipulation.
 
 ## Motivation
 
